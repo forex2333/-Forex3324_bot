@@ -1,16 +1,17 @@
+
 import os
 import requests
+import time
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+# Test signal message
+message = """
+🟡 XAUUSD — GOLD 5M
 
-data = {
-    "chat_id": CHAT_ID,
-    "text": "✅ Forex3324 Bot is working!\n\nTelegram connection successful."
-}
+⚠️ TEST SIGNAL
 
-response = requests.post(url, data=data)
+BUY / SELL analysis system is being connected.
 
-print(response.text)
+Timeframe: 5
