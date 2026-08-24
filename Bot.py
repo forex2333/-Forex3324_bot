@@ -9,7 +9,7 @@ URL = "https://api.twelvedata.com/time_series"
 
 params = {
     "symbol": "XAU/USD",
-    "interval": "5min",
+    "interval": "30min",
     "outputsize": 100,
     "apikey": API_KEY
 }
@@ -105,7 +105,7 @@ if signal == "BUY":
     tp = current + (risk * 1.5)
 
     message = (
-        "🟢 STRONG BUY — XAUUSD 5M\n\n"
+        "🟢 STRONG BUY — XAUUSD 30M\n\n"
         f"Entry: {current:.2f}\n"
         f"SL: {sl:.2f}\n"
         f"TP: {tp:.2f}\n\n"
@@ -126,7 +126,7 @@ elif signal == "SELL":
     tp = current - (risk * 1.5)
 
     message = (
-        "🔴 STRONG SELL — XAUUSD 5M\n\n"
+        "🔴 STRONG SELL — XAUUSD 30M\n\n"
         f"Entry: {current:.2f}\n"
         f"SL: {sl:.2f}\n"
         f"TP: {tp:.2f}\n\n"
