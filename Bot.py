@@ -1,362 +1,272 @@
 import os
+import time
 import requests
-import hashlib
-import json
-from pathlib import Path
+import pandas as pd
+import yfinance as yf
 
 # =========================
-# SETTINGS
+# TELEGRAM SETTINGS
 # =========================
 
-TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-API_KEY = os.environ["TWELVE_DATA_API_KEY"]
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-INTERVAL = "30min"
-OUTPUT_SIZE = 100
+# =========================
+# SYMBOLS
+# =========================
 
 SYMBOLS = {
-    "XAU/USD": "🟡 GOLD",
-    "BTC/USD": "₿ BTC",
-    "EUR/USD": "💶 EURUSD",
-    "XAU/EUR": "🟠 XAUEUR",
+    "XAUUSD": "GC=F",      # Gold
+    "BTCUSD": "BTC-USD",   # Bitcoin
+    "EURUSD": "EURUSD=X",  # Euro / USD
+    "XAUEUR": "GC=F"       # Gold proxy; EUR conversion handled below
 }
 
-TELEGRAM_URL = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-
-# File used to remember the last signal between GitHub Actions runs
-STATE_FILE = Path("signal_state.json")
-
+TIMEFRAME = "30m"
+PERIOD = "5d"
 
 # =========================
 # TELEGRAM
 # =========================
 
 def send_telegram(message):
-    response = requests.post(
-        TELEGRAM_URL,
-        data={
-            "chat_id": CHAT_ID,
-            "text": message
-        },
-        timeout=20
-    )
+    if not BOT_TOKEN or not CHAT_ID:
+        print("Telegram credentials missing.")
+        return
 
-    response.raise_for_status()
-    print("Telegram:", response.text)
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+
+    try:
+        requests.post(
+            url,
+            data={
+                "chat_id": CHAT_ID,
+                "text": message
+            },
+            timeout=20
+        )
+    except Exception as e:
+        print("Telegram error:", e)
+
+
+# =========================
+# DATA
+# =========================
+
+def get_data(symbol):
+    try:
+        data = yf.download(
+            symbol,
+            period=PERIOD,
+            interval=TIMEFRAME,
+            progress=False,
+            auto_adjust=False
+        )
+
+        if data.empty:
+            return None
+
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
+
+        data = data.dropna()
+
+        if len(data) < 50:
+            return None
+
+        return data
+
+    except Exception as e:
+        print(f"Data error {symbol}:", e)
+        return None
 
 
 # =========================
 # INDICATORS
 # =========================
 
-def ema(values, period):
-    if len(values) < period:
-        return None
+def calculate_indicators(df):
 
-    multiplier = 2 / (period + 1)
+    close = df["Close"]
 
-    result = sum(values[:period]) / period
+    # EMA
+    df["EMA20"] = close.ewm(span=20, adjust=False).mean()
+    df["EMA50"] = close.ewm(span=50, adjust=False).mean()
 
-    for price in values[period:]:
-        result = (price - result) * multiplier + result
+    # RSI
+    delta = close.diff()
 
-    return result
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
 
+    avg_gain = gain.rolling(14).mean()
+    avg_loss = loss.rolling(14).mean()
 
-def rsi(values, period=14):
-    if len(values) <= period:
-        return None
+    rs = avg_gain / avg_loss.replace(0, 0.000001)
 
-    gains = []
-    losses = []
+    df["RSI"] = 100 - (100 / (1 + rs))
 
-    for i in range(1, len(values)):
-        change = values[i] - values[i - 1]
+    # MACD
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
 
-        gains.append(max(change, 0))
-        losses.append(max(-change, 0))
+    df["MACD"] = ema12 - ema26
+    df["MACD_SIGNAL"] = df["MACD"].ewm(span=9, adjust=False).mean()
 
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-
-    for i in range(period, len(gains)):
-        avg_gain = ((avg_gain * (period - 1)) + gains[i]) / period
-        avg_loss = ((avg_loss * (period - 1)) + losses[i]) / period
-
-    if avg_loss == 0:
-        return 100.0
-
-    rs = avg_gain / avg_loss
-
-    return 100 - (100 / (1 + rs))
+    return df
 
 
 # =========================
-# LOAD / SAVE SIGNAL STATE
+# SIGNAL ENGINE
 # =========================
 
-def load_state():
-    if not STATE_FILE.exists():
-        return {}
+def get_signal(df):
 
-    try:
-        with open(STATE_FILE, "r") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+    df = calculate_indicators(df)
 
+    last = df.iloc[-1]
+    previous = df.iloc[-2]
 
-def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+    price = float(last["Close"])
+    ema20 = float(last["EMA20"])
+    ema50 = float(last["EMA50"])
+    rsi = float(last["RSI"])
+    macd = float(last["MACD"])
+    macd_signal = float(last["MACD_SIGNAL"])
 
+    score_buy = 0
+    score_sell = 0
 
-# =========================
-# GET MARKET DATA
-# =========================
+    # EMA trend
+    if ema20 > ema50:
+        score_buy += 2
+    elif ema20 < ema50:
+        score_sell += 2
 
-def get_candles(symbol):
-    url = "https://api.twelvedata.com/time_series"
+    # RSI
+    if 50 < rsi < 70:
+        score_buy += 1
+    elif 30 < rsi < 50:
+        score_sell += 1
 
-    params = {
-        "symbol": symbol,
-        "interval": INTERVAL,
-        "outputsize": OUTPUT_SIZE,
-        "apikey": API_KEY
-    }
+    # MACD
+    if macd > macd_signal:
+        score_buy += 2
+    elif macd < macd_signal:
+        score_sell += 2
 
-    response = requests.get(
-        url,
-        params=params,
-        timeout=20
-    )
+    # Price vs EMA20
+    if price > ema20:
+        score_buy += 1
+    elif price < ema20:
+        score_sell += 1
 
-    response.raise_for_status()
+    # Final signal
+    if score_buy >= 5 and score_buy > score_sell:
+        return "BUY", price, rsi, score_buy
 
-    data = response.json()
+    if score_sell >= 5 and score_sell > score_buy:
+        return "SELL", price, rsi, score_sell
 
-    if data.get("status") == "error":
-        print(f"{symbol} data error:", data)
-        return None
-
-    if "values" not in data:
-        print(f"{symbol}: No candle data received")
-        return None
-
-    candles = list(reversed(data["values"]))
-
-    return candles
+    return None, price, rsi, max(score_buy, score_sell)
 
 
 # =========================
-# ANALYZE ONE SYMBOL
+# MAIN CHECK
 # =========================
 
-def analyze_symbol(symbol, state):
+def check_symbol(name, ticker):
 
-    candles = get_candles(symbol)
+    data = get_data(ticker)
 
-    if not candles or len(candles) < 30:
-        print(f"{symbol}: Not enough data")
+    if data is None:
+        print(f"{name}: No data")
         return
 
-    closes = [float(c["close"]) for c in candles]
-    highs = [float(c["high"]) for c in candles]
-    lows = [float(c["low"]) for c in candles]
-
-    times = [c.get("datetime", "") for c in candles]
-
-    current = closes[-1]
-    previous = closes[-2]
-
-    current_high = highs[-1]
-    current_low = lows[-1]
-
-    candle_time = times[-1]
-
-    ema9 = ema(closes, 9)
-    ema21 = ema(closes, 21)
-    rsi14 = rsi(closes, 14)
-
-    if ema9 is None or ema21 is None or rsi14 is None:
-        print(f"{symbol}: Indicator calculation failed")
-        return
-
-    # =========================
-    # STRONG BUY CONDITIONS
-    # =========================
-
-    buy_conditions = [
-        ema9 > ema21,
-        rsi14 >= 55,
-        current > previous,
-        current > ema9
-    ]
-
-    buy_score = sum(buy_conditions)
-
-    # =========================
-    # STRONG SELL CONDITIONS
-    # =========================
-
-    sell_conditions = [
-        ema9 < ema21,
-        rsi14 <= 45,
-        current < previous,
-        current < ema9
-    ]
-
-    sell_score = sum(sell_conditions)
-
-    signal = None
-    strength = 0
-
-    # Require ALL 4 confirmations
-    if buy_score == 4:
-        signal = "BUY"
-        strength = 4
-
-    elif sell_score == 4:
-        signal = "SELL"
-        strength = 4
-
-    # =========================
-    # NO SIGNAL
-    # =========================
-
-    if signal is None:
-
-        print(
-            f"NO SIGNAL | {symbol} | "
-            f"Price={current:.5f} | "
-            f"EMA9={ema9:.5f} | "
-            f"EMA21={ema21:.5f} | "
-            f"RSI={rsi14:.1f}"
-        )
-
-        return
-
-    # =========================
-    # DUPLICATE PROTECTION
-    # =========================
-
-    signal_id = f"{symbol}_{candle_time}_{signal}"
-
-    old_signal = state.get(symbol)
-
-    if old_signal == signal_id:
-
-        print(
-            f"DUPLICATE BLOCKED | "
-            f"{symbol} {signal} | "
-            f"Candle={candle_time}"
-        )
-
-        return
-
-    # =========================
-    # SL / TP
-    # =========================
-
-    if signal == "BUY":
-
-        risk = current - current_low
-
-        if risk <= 0:
-            risk = current * 0.001
-
-        sl = current - risk
-        tp = current + (risk * 1.5)
-
-        emoji = "🟢"
-
-    else:
-
-        risk = current_high - current
-
-        if risk <= 0:
-            risk = current * 0.001
-
-        sl = current + risk
-        tp = current - (risk * 1.5)
-
-        emoji = "🔴"
-
-    market_name = SYMBOLS.get(symbol, symbol)
-
-    # =========================
-    # TELEGRAM MESSAGE
-    # =========================
-
-    message = (
-        f"{emoji} STRONG {signal} — {market_name}\n"
-        f"📊 {symbol} | 30M\n\n"
-
-        f"💰 Entry: {current:.5f}\n"
-        f"🛑 SL: {sl:.5f}\n"
-        f"🎯 TP: {tp:.5f}\n\n"
-
-        f"📈 EMA 9: {ema9:.5f}\n"
-        f"📉 EMA 21: {ema21:.5f}\n"
-        f"📊 RSI: {rsi14:.1f}\n"
-        f"💪 Confirmation: {strength}/4\n\n"
-
-        f"🕐 Candle: {candle_time}\n\n"
-
-        "⚠️ Indicator-based signal. "
-        "Trading involves risk; no signal is guaranteed."
-    )
-
-    # =========================
-    # SEND TELEGRAM
-    # =========================
-
-    send_telegram(message)
-
-    # Save signal so it isn't repeated
-    state[symbol] = signal_id
+    signal, price, rsi, score = get_signal(data)
 
     print(
-        f"SIGNAL SENT | {symbol} | "
-        f"{signal} | Candle={candle_time}"
+        f"{name} | Price: {price:.5f} | "
+        f"RSI: {rsi:.2f} | Score: {score} | "
+        f"Signal: {signal}"
     )
+
+    if signal:
+
+        emoji = "🟢" if signal == "BUY" else "🔴"
+
+        message = (
+            f"{emoji} {name} — 30M\n\n"
+            f"📊 SIGNAL: {signal}\n"
+            f"💰 Price: {price:.5f}\n"
+            f"📈 RSI: {rsi:.2f}\n"
+            f"💪 Strength: {score}/6\n\n"
+            f"⚠️ This is a technical signal, not a guarantee."
+        )
+
+        send_telegram(message)
 
 
 # =========================
-# MAIN
+# RUN
 # =========================
 
 def main():
 
-    print("=" * 60)
-    print("XAU/BTC/EUR SIGNAL BOT")
-    print("Timeframe:", INTERVAL)
-    print("Markets:", ", ".join(SYMBOLS.keys()))
-    print("=" * 60)
+    print("================================")
+    print("30M SIGNAL BOT STARTED")
+    print("================================")
 
-    state = load_state()
+    sent_signals = {}
 
-    for symbol in SYMBOLS:
+    while True:
 
-        try:
+        for name, ticker in SYMBOLS.items():
 
-            analyze_symbol(
-                symbol,
-                state
-            )
+            try:
 
-        except Exception as e:
+                data = get_data(ticker)
 
-            print(
-                f"ERROR processing {symbol}: {e}"
-            )
+                if data is None:
+                    continue
 
-    save_state(state)
+                signal, price, rsi, score = get_signal(data)
 
-    print("=" * 60)
-    print("CHECK COMPLETE")
-    print("=" * 60)
+                print(
+                    f"{name}: {signal} | "
+                    f"Price={price:.5f} | "
+                    f"RSI={rsi:.2f} | "
+                    f"Score={score}/6"
+                )
+
+                if signal:
+
+                    # Avoid sending the same signal repeatedly
+                    candle_time = str(data.index[-1])
+                    signal_id = f"{name}_{candle_time}_{signal}"
+
+                    if sent_signals.get(name) != signal_id:
+
+                        emoji = "🟢" if signal == "BUY" else "🔴"
+
+                        message = (
+                            f"{emoji} {name} — 30M\n\n"
+                            f"📊 SIGNAL: {signal}\n"
+                            f"💰 Price: {price:.5f}\n"
+                            f"📈 RSI: {rsi:.2f}\n"
+                            f"💪 Strength: {score}/6\n\n"
+                            f"⚠️ Technical signal only."
+                        )
+
+                        send_telegram(message)
+
+                        sent_signals[name] = signal_id
+
+            except Exception as e:
+                print(f"{name} error:", e)
+
+        # Check approximately every 5 minutes
+        time.sleep(300)
 
 
 if __name__ == "__main__":
